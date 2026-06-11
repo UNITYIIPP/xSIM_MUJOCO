@@ -898,12 +898,14 @@ def _spin_wrapper(node):
 def main():
     # 设置模型注册表
     model_registry = {
-        'evt2': '../resources/evt2/urdf/evt2.xml'
+        'evt2': '../resources/evt2/urdf/evt2.xml',
+        'tg3': '../resources/tiangong3/urdf/tiangong3.xml',
+        'tg3_terrain': '../resources/tiangong3/urdf/scene_terrain.xml',
     }
 
     # 解析命令行参数
     parser = argparse.ArgumentParser(description='MuJoCo机器人仿真器')
-    parser.add_argument('--model', '-m', type=str, default='evt2',
+    parser.add_argument('--model', '-m', type=str, default='tg3',
                         choices=list(model_registry.keys()),
                         help='要加载的机器人模型')
     parser.add_argument('--config', '-c', type=str, default='full',

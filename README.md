@@ -8,10 +8,13 @@
 .
 ├── README.md                # 项目说明文档
 ├── resources                # 机器人模型文件
+│   ├── tiangong3            # 天工3.0 机器人模型
+│   └── terrain              # 地形高程图等资源
 │   ├── evt2
 └── scripts                      # Python 脚本目录
     ├── convert_xml.py           # URDF 到 XML 转换工具
     ├── elastic_band.py          # 弹性带控制器
+    ├── terrain_generator.py     # 地形场景生成工具
     └── simulator_view_asyn.py   # 异步仿真器（支持 ROS2）
 ```
 
@@ -37,7 +40,7 @@
 
 ```bash
 # 建议使用虚拟环境
-pip install mujoco numpy matplotlib pynput
+pip install mujoco numpy matplotlib pynput pillow
 ```
 bodyctrl_msg 位于xmigcs/lib/下
 ```bash
@@ -54,12 +57,36 @@ sudo dpkg -i ros-humble*.deb
 # ros2 = jazzy
 source /opt/ros/jazzy/setup.bash
 export ROS_DOMAIN_ID=your_domain_id
-python scripts/simulator_view_asyn.py -m evt2(机器人名称)
+python scripts/simulator_view_asyn.py -m tg3(机器人名称)
 
 # ros2 = humble
 source /opt/ros/humble/setup.bash
 export ROS_DOMAIN_ID=your_domain_id
-python scripts/simulator_view_asyn.py -m evt2(机器人名称)
+python scripts/simulator_view_asyn.py -m tg3(机器人名称)
+```
+
+#### 地形测试场景
+
+项目内置一组综合地形测试场地，包含：
+
+- 三档楼梯：台阶高度 8cm / 12cm / 18cm，每档含上楼梯与下楼梯首尾相连
+- 三档上下坡：坡度 10° / 20° / 30°，每档含上坡与下坡首尾相连
+- 梅花桩：交错排列圆柱踏桩
+- 随机起伏地形：Perlin 风格高度场
+- 随机路面：随机高度与姿态的路面砖块
+
+地形场景使用 **tiangong3 (tg3)** 机器人，生成与加载方式：
+
+```bash
+# 生成地形
+python scripts/terrain_generator.py
+# 地形场景
+机器人出生点在场地原点，沿 +X 方向依次经过：起伏地形 → 随机路面 → 梅花桩 → 楼梯 → 上下坡。
+
+# 以ros2 = humble 为例
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=your_domain_id
+python scripts/simulator_view_asyn.py -m tg3_terrain
 ```
 
 ## 主要脚本说明
