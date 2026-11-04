@@ -17,6 +17,7 @@ from queue import Queue, Full
 from pynput import keyboard
 from scipy.spatial.transform import Rotation
 import os
+import subprocess
 from elastic_band import ElasticBand
 import argparse
 
@@ -36,11 +37,28 @@ def quaternion_to_euler_scipy(w, x, y, z, degrees=False):
 
 class RobotSimulator:
 
-    def __init__(self, model_path, node: Node | None = None, debug=False, robot_config='full'):
+    def __init__(self, model_path, node: Node | None = None, debug=False,
+                 robot_config='full', video_path=None):
         self.debug = debug
         # 加载模型
         self.model = mujoco.MjModel.from_xml_path(model_path)
         self.data = mujoco.MjData(self.model)
+
+        # 视频录制配置。录制器在 viewer 线程内创建和使用，避免跨线程使用
+        # OpenGL 上下文。
+        self.video_path = video_path
+        self.video_fps = 30
+        self.video_width = 1280
+        self.video_height = 720
+        self.video_renderer = None
+        self.video_process = None
+        self.video_frame_count = 0
+        if self.video_path:
+            # MuJoCo 的离屏缓冲区必须不小于输出视频尺寸。
+            self.model.vis.global_.offwidth = max(
+                self.model.vis.global_.offwidth, self.video_width)
+            self.model.vis.global_.offheight = max(
+                self.model.vis.global_.offheight, self.video_height)
 
         # 初始化控制模式 (0=(位置控制(仅上半身)和力控都存在), 1=全身仅力矩控制)
         self.control_mode = 1
@@ -543,14 +561,94 @@ class RobotSimulator:
                     self.data.ctrl[motor_index] = self.joint_commands[joint_name]
     def viewer_thread(self):
         try:
+            if self.video_path:
+                self._start_video_recording()
+
+            video_interval = 1.0 / self.video_fps
+            next_video_frame_time = time.perf_counter()
             while self.viewer.is_running() and not self.stop_event.is_set():
+                frame = None
+                frames_to_write = 0
+                current_time = time.perf_counter()
                 with self.sim_view_lock:
                     self.viewer.sync()
+
+                    if (self.video_renderer is not None and
+                            current_time >= next_video_frame_time):
+                        # 使用当前交互式 viewer 的相机，录制画面会跟随用户的
+                        # 旋转、平移和缩放操作。
+                        self.video_renderer.update_scene(
+                            self.data, camera=self.viewer.cam)
+                        frame = self.video_renderer.render()
+
+                        # 若渲染偶尔变慢，补写上一时刻的画面，保证视频时长
+                        # 与实际运行时长一致。
+                        frames_to_write = max(
+                            1,
+                            int((current_time - next_video_frame_time) /
+                                video_interval) + 1)
+                        next_video_frame_time += frames_to_write * video_interval
+
+                if frame is not None:
+                    frame_bytes = frame.tobytes()
+                    for _ in range(frames_to_write):
+                        self.video_process.stdin.write(frame_bytes)
+                        self.video_frame_count += 1
                 time.sleep(self.view_dt)
         except Exception as e:
             print(f"Viewer thread error: {e}")
+            self.stop_event.set()
         finally:
+            self._stop_video_recording()
             print("Viewer thread stopped")
+
+    def _start_video_recording(self):
+        """创建离屏渲染器和 MP4 写入器。"""
+        output_dir = os.path.dirname(self.video_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        self.video_renderer = mujoco.Renderer(
+            self.model, height=self.video_height, width=self.video_width)
+
+        ffmpeg_command = [
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+            '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+            '-s:v', f'{self.video_width}x{self.video_height}',
+            '-r', str(self.video_fps), '-i', '-', '-an',
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18',
+            '-pix_fmt', 'yuv420p', self.video_path
+        ]
+        try:
+            self.video_process = subprocess.Popen(
+                ffmpeg_command, stdin=subprocess.PIPE)
+        except FileNotFoundError as exc:
+            self.video_renderer.close()
+            self.video_renderer = None
+            raise RuntimeError(
+                "录制视频需要 FFmpeg，请先安装 ffmpeg") from exc
+
+        print(f"开始录制视频: {self.video_path}")
+
+    def _stop_video_recording(self):
+        """释放视频相关资源，并确保 MP4 文件正确封装。"""
+        ffmpeg_return_code = None
+        if self.video_process is not None:
+            if self.video_process.stdin is not None:
+                try:
+                    self.video_process.stdin.close()
+                except BrokenPipeError:
+                    pass
+            ffmpeg_return_code = self.video_process.wait()
+            self.video_process = None
+        if self.video_renderer is not None:
+            self.video_renderer.close()
+            self.video_renderer = None
+        if (self.video_path and self.video_frame_count > 0 and
+                ffmpeg_return_code == 0):
+            print(f"视频已保存: {self.video_path} ({self.video_frame_count} 帧)")
+        elif ffmpeg_return_code not in (None, 0):
+            print(f"视频编码失败，FFmpeg 返回码: {ffmpeg_return_code}")
 
     def read_sensors(self):
         """读取所有传感器数据"""
@@ -828,7 +926,8 @@ class RobotSimulator:
             self.stop_event.set()
 
             # 等待线程结束
-            viewer_thread.join(timeout=1.0)
+            # 录制时等待 viewer 线程关闭 FFmpeg，确保 MP4 文件完成封装。
+            viewer_thread.join(timeout=None if self.video_path else 1.0)
             sim_thread.join(timeout=1.0)
             # 停止发布线程
             self.stop_publishing()
@@ -911,6 +1010,9 @@ def main():
     parser.add_argument('--config', '-c', type=str, default='full',
                         choices=['full', '21'],
                         help='机器人配置 (full=完整配置, 21=21自由度配置)')
+    parser.add_argument(
+        '--video', nargs='?', const='', default=None, metavar='OUTPUT.mp4',
+        help='录制 MP4 视频；可选指定输出路径，默认保存到 recordings 目录')
 
     args = parser.parse_args()
 
@@ -922,6 +1024,17 @@ def main():
     print(f"正在加载模型: {model_path}")
     print(f"机器人配置: {args.config}")
 
+    video_path = None
+    if args.video is not None:
+        if args.video:
+            video_path = os.path.abspath(os.path.expanduser(args.video))
+            if not video_path.lower().endswith('.mp4'):
+                video_path += '.mp4'
+        else:
+            timestamp = time.strftime('%Y%m%d_%H%M%S')
+            video_path = os.path.abspath(os.path.join(
+                'recordings', f'simulation_{args.model}_{timestamp}.mp4'))
+
     # 创建控制器
     rclpy.init()
     node = rclpy.create_node('mujoco_simulator_dex')
@@ -930,7 +1043,9 @@ def main():
                                    daemon=True,
                                    name="ROS2_Spin_Thread")
     spin_thread.start()
-    simulator = RobotSimulator(model_path, node, debug=False, robot_config=args.config)
+    simulator = RobotSimulator(
+        model_path, node, debug=False, robot_config=args.config,
+        video_path=video_path)
 
     # 运行仿真
     simulator.start()
